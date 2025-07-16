@@ -1,5 +1,6 @@
 CHANNEL_ID= ""
-STREAM_KEY = ""  # Replace with your key
+STREAM_KEY = ""  # Replace with your key    
+SOURCE_CHANNEL_ID = ""
 
 import os
 import time
@@ -26,7 +27,7 @@ TOKEN_FILE = "token.json"
 
 # Stream settings
 DOWNLOAD_DIR = "./downloads"
-MORNING_HOURS = (2, 11)  # 5AM to 7AM
+MORNING_HOURS = (11, 23)  # 5PM to 11PM PST
 MIN_DURATION = 6 * 3600  # 6 hours minimum
 FRAMERATE = 30
 INTRA = 60  # Keyframe interval
@@ -51,7 +52,7 @@ class StreamManager:
     def authenticate(self):
         """Authenticate with YouTube API with detailed logging"""
         logging.info("Starting authentication process")
-
+        
         creds = None
         if os.path.exists(TOKEN_FILE):
             logging.info("Found existing token file")
@@ -70,7 +71,7 @@ class StreamManager:
                 logging.info("Please complete the OAuth flow in your browser")
                 creds = flow.run_local_server(port=0)
                 logging.info("Successfully obtained credentials")
-
+            
             with open(TOKEN_FILE, 'w') as token:
                 token.write(creds.to_json())
             logging.info("Saved credentials to token file")
@@ -87,7 +88,7 @@ class StreamManager:
         if not match:
             logging.warning(f"Failed to parse duration: {duration}")
             return 0
-
+            
         hours = int(match.group(1) or 0)
         minutes = int(match.group(2) or 0)
         seconds = int(match.group(3) or 0)
@@ -98,20 +99,20 @@ class StreamManager:
     def find_random_long_stream(self):
         """Find one random live stream that meets criteria"""
         logging.info("Starting search for eligible live streams")
-
+        
         try:
             logging.info("Searching for live broadcasts from channel")
             search_response = self.youtube.search().list(
-                channelId=CHANNEL_ID,
+                channelId=SOURCE_CHANNEL_ID,
                 part="id,snippet",
                 type="video",
                 eventType="completed",  # Search completed live streams
                 maxResults=50,
                 order="date"  # Most recent first
             ).execute()
-
+            
             logging.info(f"Found {len(search_response['items'])} live streams")
-
+            
             # Filter for morning streams
             candidates = []
             for item in search_response["items"]:
@@ -119,7 +120,7 @@ class StreamManager:
                     published_at = item["snippet"]["publishedAt"]
                     dt = datetime.strptime(published_at, "%Y-%m-%dT%H:%M:%SZ")
                     logging.debug(f"Checking live stream {item['snippet']['title']} from {dt}")
-
+                    
                     if MORNING_HOURS[0] <= dt.hour < MORNING_HOURS[1]:
                         video_info = {
                             "id": item["id"]["videoId"],
@@ -131,31 +132,31 @@ class StreamManager:
                 except Exception as e:
                     logging.warning(f"Error processing live stream: {e}")
                     continue
-
+    
             if not candidates:
                 logging.warning("No morning live streams found")
                 return None
-
+    
             logging.info(f"Found {len(candidates)} potential morning live streams")
             stream = random.choice(candidates)
             logging.info(f"Selected random live stream: {stream['title']}")
-
+    
             # Verify duration (1 additional API call)
             video_response = self.youtube.videos().list(
                 id=stream["id"],
                 part="contentDetails"
             ).execute()
-
+    
             duration = self.parse_duration(video_response["items"][0]["contentDetails"]["duration"])
             logging.info(f"Live stream duration: {duration//3600}h {duration%3600//60}m")
-
+    
             if duration >= MIN_DURATION:
                 logging.info("Live stream meets all criteria")
                 return stream
-
+            
             logging.warning("Live stream duration too short")
             return None
-
+    
         except Exception as e:
             logging.error(f"Error finding live stream: {e}", exc_info=True)
             return None
@@ -209,7 +210,7 @@ class StreamManager:
     def start_stream(self, input_file):
         """Start FFmpeg streaming with detailed logging"""
         logging.info(f"Preparing to stream file: {input_file}")
-
+        
         if not os.path.exists(input_file):
             logging.error("Input file does not exist")
             return False
@@ -280,7 +281,7 @@ class StreamManager:
         logging.info("Starting cleanup of old files")
         now = time.time()
         removed_count = 0
-
+        
         for filename in os.listdir(DOWNLOAD_DIR):
             filepath = os.path.join(DOWNLOAD_DIR, filename)
             try:
@@ -293,13 +294,13 @@ class StreamManager:
             except Exception as e:
                 logging.warning(f"Error cleaning up file {filename}: {e}")
                 continue
-
+        
         logging.info(f"Cleanup complete. Removed {removed_count} files")
 
     def run(self):
         """Main streaming loop with detailed operation logging"""
         logging.info("Starting main streaming loop")
-
+        
         self.youtube = self.authenticate()
         if not self.youtube:
             logging.error("Failed to authenticate with YouTube API")
@@ -322,7 +323,7 @@ class StreamManager:
                 logging.info(f"Found stream: {self.current_stream['title']}")
                 logging.info(f"Stream URL: {self.current_stream['url']}")
                 logging.info("Starting download...")
-
+                
                 current_file = self.download_stream(self.current_stream)
                 if not current_file:
                     logging.error("Download failed, waiting 60 seconds")
@@ -343,7 +344,7 @@ class StreamManager:
                 def prepare_next():
                     logging.info(f"Waiting {PREPARE_NEXT_AFTER//60} minutes to prepare next stream")
                     time.sleep(PREPARE_NEXT_AFTER)
-
+                    
                     logging.info("Preparing next stream...")
                     self.next_stream = self.find_random_long_stream()
                     if self.next_stream:
@@ -351,7 +352,7 @@ class StreamManager:
                         self.download_stream(self.next_stream)
                     else:
                         logging.warning("No next stream found")
-
+                    
                     self.cleanup_old_files()
 
                 threading.Thread(target=prepare_next, daemon=True).start()
@@ -367,7 +368,7 @@ class StreamManager:
                     remaining = max(0, duration - elapsed)
                     logging.debug(f"Stream progress: {elapsed//3600:.0f}h {elapsed%3600//60:.0f}m elapsed, "
                                 f"{remaining//3600:.0f}h {remaining%3600//60:.0f}m remaining")
-
+                    
                     if self.ffmpeg_process.poll() is not None:
                         logging.warning("FFmpeg process ended prematurely")
                         break
