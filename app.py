@@ -96,7 +96,7 @@ class StreamManager:
         logging.debug(f"Parsed duration: {hours}h {minutes}m {seconds}s = {total_seconds} seconds")
         return total_seconds
 
-    def find_random_long_stream(self):
+    def find_random_long_stream(self, exclude_id=None):
         """Find one random live stream that meets criteria"""
         logging.info("Starting search for eligible live streams")
         
@@ -116,6 +116,9 @@ class StreamManager:
             # Filter for morning streams
             candidates = []
             for item in search_response["items"]:
+                video_id = item["id"]["videoId"]
+                if exclude_id and video_id == exclude_id:
+                    continue
                 try:
                     published_at = item["snippet"]["publishedAt"]
                     dt = datetime.strptime(published_at, "%Y-%m-%dT%H:%M:%SZ")
@@ -181,7 +184,8 @@ class StreamManager:
 
         for attempt in range(MAX_RETRIES):
             try:
-                logging.info(f"Download attempt {attempt + 1} of {MAX_RETRIES}")
+                logging.info(f"Download attempt {attempt + 1} of {MAX_RETRIES}, sleeping 100")
+                time.sleep(100)
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                     ydl.download([stream['url']])
                 logging.info("Download completed successfully")
@@ -196,6 +200,51 @@ class StreamManager:
                     return None
                 logging.info("Waiting 5 seconds before retry...")
                 time.sleep(5)
+
+    def _download_with_youtube_api(self, stream, filename):
+        """Fallback download using YouTube API"""
+        logging.info("Attempting YouTube API download")
+        
+        try:
+            # Get stream URL via YouTube API
+            request = self.youtube.videos().list(
+                part="contentDetails,status",
+                id=stream['id']
+            )
+            response = request.execute()
+            
+            if not response.get('items'):
+                logging.error("No video found via API")
+                return False
+    
+            # Check if download is allowed
+            if response['items'][0]['status']['embeddable'] and \
+               response['items'][0]['status']['publicStatsViewable']:
+                
+                # Use yt-dlp with authenticated session
+                ydl_opts = {
+                    'outtmpl': filename,
+                    'format': 'best',
+                    'cookiefile': TOKEN_FILE,  # Use authenticated session
+                    'extract_flat': False,
+                    'progress_hooks': [self.download_progress_hook],
+                }
+    
+                try:
+                    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                        ydl.download([stream['url']])
+                    logging.info("YouTube API download completed successfully")
+                    return True
+                except Exception as e:
+                    logging.error(f"YouTube API download failed: {e}")
+                    return False
+            else:
+                logging.error("Video is not available for download via API")
+                return False
+
+        except Exception as e:
+            logging.error(f"YouTube API access error: {e}")
+            return False
 
     def download_progress_hook(self, d):
         """Callback for download progress"""
@@ -276,7 +325,7 @@ class StreamManager:
             logging.error(f"Error getting duration: {e}")
             return MIN_DURATION  # Default if can't determine
 
-    def cleanup_old_files(self):
+    def cleanup_old_files(self, exclude=None, exclude_next=None):
         """Cleanup old files with logging"""
         logging.info("Starting cleanup of old files")
         now = time.time()
@@ -286,6 +335,9 @@ class StreamManager:
             filepath = os.path.join(DOWNLOAD_DIR, filename)
             try:
                 if os.path.isfile(filepath):
+                    file_id = os.path.splitext(filename)[0]
+                    if (exclude and file_id == exclude) or (exclude_next and file_id == exclude_next):
+                        continue
                     file_age = now - os.path.getmtime(filepath)
                     if file_age > CLEANUP_OLDER_THAN:
                         logging.info(f"Removing old file: {filename} (age: {file_age/3600:.1f} hours)")
@@ -317,7 +369,7 @@ class StreamManager:
                 self.current_stream = self.find_random_long_stream()
                 if not self.current_stream:
                     logging.warning("No suitable stream found, waiting 60 seconds")
-                    time.sleep(60)
+                    time.sleep(15)
                     continue
 
                 logging.info(f"Found stream: {self.current_stream['title']}")
@@ -327,14 +379,14 @@ class StreamManager:
                 current_file = self.download_stream(self.current_stream)
                 if not current_file:
                     logging.error("Download failed, waiting 60 seconds")
-                    time.sleep(60)
+                    time.sleep(15)
                     continue
 
                 # Start streaming
                 logging.info("Starting FFmpeg streaming process")
                 if not self.start_stream(current_file):
                     logging.error("Failed to start streaming, waiting 60 seconds")
-                    time.sleep(60)
+                    time.sleep(15)
                     continue
 
                 duration = self.get_duration(current_file)
@@ -346,14 +398,14 @@ class StreamManager:
                     time.sleep(PREPARE_NEXT_AFTER)
                     
                     logging.info("Preparing next stream...")
-                    self.next_stream = self.find_random_long_stream()
+                    self.next_stream = self.find_random_long_stream(exclude_id=self.current_stream['id'] if self.current_stream else None)
                     if self.next_stream:
                         logging.info(f"Found next stream: {self.next_stream['title']}")
                         self.download_stream(self.next_stream)
                     else:
                         logging.warning("No next stream found")
                     
-                    self.cleanup_old_files()
+                    self.cleanup_old_files(exclude=self.current_stream['id'] if self.current_stream else None, exclude_next=self.next_stream['id'] if self.next_stream else None)
 
                 threading.Thread(target=prepare_next, daemon=True).start()
 
@@ -388,16 +440,38 @@ class StreamManager:
 
                 if self.next_stream:
                     logging.info("Switching to next prepared stream")
+                    # Get the filename for the next stream
+                    next_file = os.path.join(DOWNLOAD_DIR, f"{self.next_stream['id']}.mp4")
+    
+                    # Start streaming the next file
+                    if os.path.exists(next_file) and self.next_stream['id'] != self.current_stream['id']:
+                        if not self.start_stream(next_file):
+                            logging.error("Failed to start next stream")
+                            continue
+    
+                    # Update references
+                    old_stream = self.current_stream
                     self.current_stream = self.next_stream
                     self.next_stream = None
+                    if old_stream:
+                        old_file = os.path.join(DOWNLOAD_DIR, f"{old_stream['id']}.mp4")
+                        if os.path.exists(old_file):
+                            logging.info(f"Cleaning up previous stream file: {old_file}")
+                            os.remove(old_file)
+                    # Reset timing for the new stream
+                    duration = self.get_duration(next_file)
+                    start_time = time.time()
+                    estimated_end = start_time + duration
+                    logging.info(f"New stream started at {time.ctime(start_time)}")
+                    logging.info(f"Estimated end time: {time.ctime(estimated_end)}")
                 else:
                     logging.warning("No next stream prepared, waiting 60 seconds")
-                    time.sleep(60)
+                    time.sleep(15)
 
             except Exception as e:
                 logging.error(f"Unexpected error in main loop: {e}", exc_info=True)
                 logging.info("Waiting 60 seconds before continuing")
-                time.sleep(60)
+                time.sleep(15)
 
     def stop(self):
         """Graceful shutdown with logging"""
